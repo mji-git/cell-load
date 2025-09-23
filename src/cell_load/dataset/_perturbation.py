@@ -298,7 +298,7 @@ class PerturbationDataset(Dataset):
             return Subset(self, perturbed_indices)
 
     @lru_cache(
-        maxsize=10000
+        maxsize=100000
     )  # cache the results of the function; lots of hits for batch mapping since most sentences have repeated cells
     def fetch_gene_expression(self, idx: int) -> torch.Tensor:
         """

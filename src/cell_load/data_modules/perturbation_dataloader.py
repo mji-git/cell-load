@@ -391,7 +391,8 @@ class PerturbationDataModule(LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=collate_fn,
             pin_memory=True,
-            prefetch_factor=4 if not test and self.num_workers > 0 else None,
+            prefetch_factor=8,
+            persistent_workers=True
         )
 
     def _setup_global_maps(self):
