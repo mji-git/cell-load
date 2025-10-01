@@ -1,9 +1,11 @@
+### Custom PerturbationDataset replaces original file cell_load/dataset/_perturbation.py
 import logging
 from pathlib import Path
 
-from functools import lru_cache
+#from functools import lru_cache
 import h5py
 import numpy as np
+import scanpy as sc
 import torch
 from torch.utils.data import Dataset, Subset
 
@@ -13,7 +15,6 @@ from ..utils.data_utils import (
     suspected_discrete_torch,
     suspected_log_torch,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -87,12 +88,15 @@ class PerturbationDataset(Dataset):
             raise ValueError(
                 f"output_space must be one of 'gene', 'all', or 'embedding'; got {self.output_space!r}"
             )
+        assert self.output_space == "all"
 
         # Load metadata cache and open file
+        # keep this logic, is fine
         self.metadata_cache = GlobalH5MetadataCache().get_cache(
             str(self.h5_path), pert_col, cell_type_key, control_pert, batch_col
         )
-        self.h5_file = h5py.File(self.h5_path, "r")
+        #self.h5_file = h5py.File(self.h5_path, "r")
+        self.raw_file = sc.read_h5ad(str(self.h5_path), backed="r")
 
         # Load cell barcodes if requested
         if self.barcode:
@@ -240,7 +244,7 @@ class PerturbationDataset(Dataset):
         """
         Get the feature dimensionality of obsm data with the specified key (e.g., 'X_uce').
         """
-        return self.h5_file[f"obsm/{key}"].shape[1]
+        return self.raw_file.obsm[key].shape[1]
 
     def get_cell_type(self, idx):
         """
@@ -297,9 +301,7 @@ class PerturbationDataset(Dataset):
         else:
             return Subset(self, perturbed_indices)
 
-    @lru_cache(
-        maxsize=100000
-    )  # cache the results of the function; lots of hits for batch mapping since most sentences have repeated cells
+    #@lru_cache(maxsize=10000)  # cache the results of the function; lots of hits for batch mapping since most sentences have repeated cells
     def fetch_gene_expression(self, idx: int) -> torch.Tensor:
         """
         Fetch raw gene counts for a given cell index.
@@ -312,30 +314,12 @@ class PerturbationDataset(Dataset):
         Returns:
             1D FloatTensor of length self.n_genes
         """
-        attrs = dict(self.h5_file["X"].attrs)
-        if attrs["encoding-type"] == "csr_matrix":
-            indptr = self.h5_file["/X/indptr"]
-            start_ptr = indptr[idx]
-            end_ptr = indptr[idx + 1]
-            sub_data = torch.tensor(
-                self.h5_file["/X/data"][start_ptr:end_ptr], dtype=torch.float32
-            )
-            sub_indices = torch.tensor(
-                self.h5_file["/X/indices"][start_ptr:end_ptr], dtype=torch.long
-            )
-            counts = torch.sparse_csr_tensor(
-                torch.tensor([0], dtype=torch.long),
-                sub_indices,
-                sub_data,
-                (1, self.n_genes),
-            )
-            data = counts.to_dense().squeeze()
-        else:
-            row_data = self.h5_file["/X"][idx]
-            data = torch.tensor(row_data, dtype=torch.float32)
+
+        row_data = self.raw_file.X[idx].toarray().squeeze()
+        data = torch.from_numpy(row_data).to(torch.float32) # shares memory
         return data
 
-    @lru_cache(maxsize=10000)
+    #@lru_cache(maxsize=10000)
     def fetch_obsm_expression(self, idx: int, key: str) -> torch.Tensor:
         """
         Fetch a single row from the /obsm/{key} embedding matrix.
@@ -346,7 +330,7 @@ class PerturbationDataset(Dataset):
         Returns:
             1D FloatTensor of that embedding
         """
-        row_data = self.h5_file[f"/obsm/{key}"][idx]
+        row_data = self.raw_file.obsm[key][idx]
         return torch.tensor(row_data, dtype=torch.float32)
 
     def get_gene_names(self, output_space="all") -> list[str]:
@@ -362,52 +346,10 @@ class PerturbationDataset(Dataset):
         def _decode(x):
             return x.decode("utf-8") if isinstance(x, (bytes, bytearray)) else str(x)
 
-        try:
-            if (
-                "var/gene_name/codes" in self.h5_file
-                and "var/gene_name/categories" in self.h5_file
-            ):
-                gene_codes = self.h5_file["var/gene_name/codes"][:]
-                gene_categories = self.h5_file["var/gene_name/categories"][:]
-                raw = gene_categories[gene_codes]
-            else:
-                try:
-                    raw = self.h5_file["var/gene_name"][:]
-                except:
-                    raw = self.h5_file["var/gene_name_index"][:]
-            if (
-                output_space == "gene"
-                and "highly_variable" in self.h5_file["/var"].keys()
-            ):
-                hvg_mask = self.h5_file["/var/highly_variable"][:]
-                raw = raw[hvg_mask]
-            elif output_space == "gene":
-                uns_key = "uns/hvg_names"
-                if uns_key in self.h5_file:
-                    hvg_names = self.h5_file[uns_key][:].astype(str)
-                    raw = hvg_names
-            return [_decode(x) for x in raw]
-        except KeyError:
-            try:
-                cats = self.h5_file["var/gene_name/categories"][:]
-                codes = self.h5_file["var/gene_name/codes"][:]
-                if (
-                    output_space == "gene"
-                    and "highly_variable" in self.h5_file["/var"].keys()
-                ):
-                    hvg_mask = self.h5_file["/var/highly_variable"][:]
-                    codes = codes[hvg_mask]
-                decoded = [_decode(x) for x in cats]
-                return [decoded[i] for i in codes]
-            except KeyError:
-                fallback = self.h5_file["var/_index"][:]
-                if (
-                    output_space == "gene"
-                    and "highly_variable" in self.h5_file["/var"].keys()
-                ):
-                    hvg_mask = self.h5_file["/var/highly_variable"][:]
-                    fallback = fallback[hvg_mask]
-                return [_decode(x) for x in fallback]
+        assert output_space == "all"
+        assert "highly_variable" not in self.raw_file.var.keys()
+        fallback = self.raw_file.var.index[:]
+        return [_decode(x) for x in fallback]
 
     ##############################
     # Static methods
@@ -488,19 +430,6 @@ class PerturbationDataset(Dataset):
             already_logged = (not is_discrete) and is_log
             batch_dict["pert_cell_counts"] = pert_cell_counts
 
-            # if already_logged:  # counts are already log transformed
-            #     if (
-            #         int_counts
-            #     ):  # if the user wants to model with raw counts, don't log transform
-            #         batch_dict["pert_cell_counts"] = torch.expm1(pert_cell_counts)
-            #     else:
-            #         batch_dict["pert_cell_counts"] = pert_cell_counts
-            # else:
-            #     if int_counts:
-            #         batch_dict["pert_cell_counts"] = pert_cell_counts
-            #     else:
-            #         batch_dict["pert_cell_counts"] = torch.log1p(pert_cell_counts)
-
         if has_ctrl_cell_counts:
             ctrl_cell_counts = torch.stack(ctrl_cell_counts_list)
 
@@ -508,19 +437,6 @@ class PerturbationDataset(Dataset):
             is_log = suspected_log_torch(pert_cell_counts)
             already_logged = (not is_discrete) and is_log
             batch_dict["ctrl_cell_counts"] = ctrl_cell_counts
-
-            # if already_logged:  # counts are already log transformed
-            #     if (
-            #         int_counts
-            #     ):  # if the user wants to model with raw counts, don't log transform
-            #         batch_dict["ctrl_cell_counts"] = torch.expm1(ctrl_cell_counts)
-            #     else:
-            #         batch_dict["ctrl_cell_counts"] = ctrl_cell_counts
-            # else:
-            #     if int_counts:
-            #         batch_dict["ctrl_cell_counts"] = ctrl_cell_counts
-            #     else:
-            #         batch_dict["ctrl_cell_counts"] = torch.log1p(ctrl_cell_counts)
 
         if has_barcodes:
             batch_dict["pert_cell_barcode"] = pert_cell_barcode_list
@@ -561,42 +477,22 @@ class PerturbationDataset(Dataset):
 
     def _get_num_genes(self) -> int:
         """Return the number of genes in the X matrix."""
-        try:
-            # Try to get shape directly from metadata
-            n_cols = self.h5_file["X"].attrs["shape"][1]
-        except KeyError:
-            try:
-                # Fallback: if not stored, try the standard dataset shape
-                n_cols = self.h5_file["X"].shape[1]
-            except Exception:
-                # Final fallback: if stored as sparse but shape isn't available, compute from indices
-                try:
-                    indices = self.h5_file["X/indices"][:]
-                    n_cols = indices.max() + 1
-                except KeyError:
-                    n_cols = self.h5_file["obsm/X_hvg"].shape[1]
+
+        # Try to get shape directly from metadata
+        n_cols = self.raw_file.X.shape[1]
         return n_cols
 
     def get_num_hvgs(self) -> int:
         """Return the number of highly variable genes in the obsm matrix."""
         try:
-            return self.h5_file["obsm/X_hvg"].shape[1]
+            return self.raw_file.obsm["X_hvg"].shape[1]
         except:
             return 0
 
     def _get_num_cells(self) -> int:
         """Return the total number of cells in the file."""
-        try:
-            n_rows = self.h5_file["X"].shape[0]
-        except Exception:
-            try:
-                # If stored as sparse
-                indptr = self.h5_file["X/indptr"][:]
-                n_rows = len(indptr) - 1
-            except Exception:
-                # if this also fails, fall back to obsm
-                n_rows = self.h5_file["obsm/X_hvg"].shape[0]
-        return n_rows
+
+        return self.raw_file.X.shape[0]
 
     def get_pert_name(self, idx: int) -> str:
         """Get perturbation name for a given index."""
@@ -610,14 +506,14 @@ class PerturbationDataset(Dataset):
 
     def __getstate__(self):
         """
-        Return a dictionary of this dataset's state without the open h5 file object.
+        Return a dictionary of this dataset's state without the dataset
         """
         # Copy the object's dict
         state = self.__dict__.copy()
         # Remove the open file object if it exists
-        if "h5_file" in state:
+        if "raw_file" in state:
             # We'll also store whether it's currently open, so that we can re-open later if needed
-            del state["h5_file"]
+            del state["raw_file"]
         return state
 
     def __setstate__(self, state):
@@ -626,8 +522,8 @@ class PerturbationDataset(Dataset):
         """
         # TODO-Abhi: remove this before release
         self.__dict__.update(state)
-        # This ensures that after we unpickle, we have a valid h5_file handle again
-        self.h5_file = h5py.File(self.h5_path, "r")
+        # This ensures that after we unpickle, we have a valid dataset
+        self.raw_file = sc.read_h5ad(str(self.h5_path), backed="r")
         self.metadata_cache = GlobalH5MetadataCache().get_cache(
             str(self.h5_path),
             self.pert_col,
@@ -638,14 +534,14 @@ class PerturbationDataset(Dataset):
 
     def _load_cell_barcodes(self) -> np.ndarray:
         """
-        Load cell barcodes from obs/_index in the H5 file.
+        Load cell barcodes from obs/_index
 
         Returns:
             np.ndarray: Array of cell barcode strings
         """
         try:
             # Try to load from obs/_index (AnnData's default storage for obs index)
-            barcodes = self.h5_file["obs/_index"][:]
+            barcodes = self.raw_file.obs.index[:]
             # Decode bytes to strings if necessary
             decoded_barcodes = []
             for barcode in barcodes:
@@ -654,26 +550,13 @@ class PerturbationDataset(Dataset):
                 else:
                     decoded_barcodes.append(str(barcode))
             return np.array(decoded_barcodes, dtype=str)
+
         except KeyError:
-            # If obs/_index doesn't exist, try obs/_index/categories and codes
-            try:
-                barcode_categories = self.h5_file["obs/_index/categories"][:]
-                barcode_codes = self.h5_file["obs/_index/codes"][:]
-                decoded_categories = []
-                for cat in barcode_categories:
-                    if isinstance(cat, (bytes, bytearray)):
-                        decoded_categories.append(cat.decode("utf-8", errors="ignore"))
-                    else:
-                        decoded_categories.append(str(cat))
-                return np.array(
-                    [decoded_categories[i] for i in barcode_codes], dtype=str
-                )
-            except KeyError:
-                # If no barcode information is available, generate generic ones
-                logger.warning(
-                    f"No cell barcode information found in {self.h5_path}. Generating generic barcodes."
-                )
-                return np.array(
-                    [f"cell_{i:06d}" for i in range(self.metadata_cache.n_cells)],
-                    dtype=str,
-                )
+            # If no barcode information is available, generate generic ones
+            logger.warning(
+                f"No cell barcode information found in {self.h5_path}. Generating generic barcodes."
+            )
+            return np.array(
+                [f"cell_{i:06d}" for i in range(self.metadata_cache.n_cells)],
+                dtype=str,
+            )
